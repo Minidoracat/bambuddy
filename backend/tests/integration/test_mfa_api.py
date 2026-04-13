@@ -244,6 +244,10 @@ class TestTOTPDisable:
             json={"code": valid_code},
             headers=_auth_header(token),
         )
+        # Reset the counter recorded by /enable so the same current-window
+        # code can be used again to disable (otherwise the replay guard in
+        # the enable path would reject it).
+        await _clear_totp_counter("disableok")
 
         # Disable with a fresh valid code
         disable_code = pyotp.TOTP(secret).now()
@@ -458,6 +462,7 @@ class TestTwoFAVerifyTOTP:
             json={"code": valid_code},
             headers=_auth_header(token),
         )
+        await _clear_totp_counter("verifytotpok")
 
         # Login now returns requires_2fa=True + pre_auth_token
         pre_auth_token = await _login_get_pre_auth_token(async_client, "verifytotpok", "verifytotpok1")
@@ -881,6 +886,7 @@ class TestPreAuthTokenSingleUse:
             json={"code": valid_code},
             headers=_auth_header(token),
         )
+        await _clear_totp_counter("singleusepat")
 
         pre_auth_token = await _login_get_pre_auth_token(async_client, "singleusepat", "singleusepat1")
 
@@ -911,6 +917,7 @@ class TestPreAuthTokenSingleUse:
             json={"code": valid_code},
             headers=_auth_header(token),
         )
+        await _clear_totp_counter("survivepatuser")
 
         pre_auth_token = await _login_get_pre_auth_token(async_client, "survivepatuser", "survivepatuser1")
 
@@ -1006,6 +1013,106 @@ class TestAdminDisableNonAdminRejection:
 # ===========================================================================
 
 
+class TestTOTPReplayAcrossEndpoints:
+    """R4-Test11: ``_assert_totp_not_replayed`` is invoked at 4 sites
+    (setup-confirm, enable, verify, regenerate-backup-codes). Earlier rounds
+    covered verify→verify and verify→disable; this class pins the remaining
+    two cross-endpoint pairs so the guard can't silently regress at any one
+    site."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_enable_code_cannot_verify_within_same_window(self, async_client: AsyncClient):
+        """The TOTP code used at /2fa/totp/enable must not then be accepted
+        at /2fa/verify if it is replayed within the same 30-second window.
+
+        The fix recorded the accepted counter on enable (previously enable
+        was the only TOTP endpoint that skipped ``_assert_totp_not_replayed``
+        entirely).
+        """
+        token = await _setup_and_login(async_client, "replayenable", "Replayenable1!")
+        setup_resp = await async_client.post("/api/v1/auth/2fa/totp/setup", headers=_auth_header(token))
+        secret = setup_resp.json()["secret"]
+        code = pyotp.TOTP(secret).now()
+
+        enable_resp = await async_client.post(
+            "/api/v1/auth/2fa/totp/enable",
+            json={"code": code},
+            headers=_auth_header(token),
+        )
+        assert enable_resp.status_code == 200
+
+        pre_auth = await _login_get_pre_auth_token(async_client, "replayenable", "Replayenable1!")
+
+        # Same code (same 30s window) — must be rejected with 400 (replay).
+        replay = await async_client.post(
+            "/api/v1/auth/2fa/verify",
+            json={"pre_auth_token": pre_auth, "method": "totp", "code": code},
+        )
+        assert replay.status_code == 400, f"TOTP replay after enable should return 400, got {replay.status_code}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_verify_code_cannot_regenerate_within_same_window(
+        self, async_client: AsyncClient, db_session: AsyncSession
+    ):
+        """A TOTP code consumed at /2fa/verify must not then be accepted by
+        /2fa/totp/regenerate-backup-codes within the same 30-second window.
+
+        We bypass the enable step (which now also records the counter and
+        would itself reject the shared-window code) by seeding an already-
+        enabled UserTOTP record directly via ``db_session``.
+        """
+        from backend.app.core.auth import get_password_hash
+        from backend.app.models.user import User as _User
+        from backend.app.models.user_totp import UserTOTP
+
+        # Enable auth first so /login and /2fa/verify are reachable.
+        await _setup_and_login(async_client, "replayregenadm", "Replayregen1A!")
+
+        username = "replayregenuser"
+        password = "Replayregen1U!"
+        user = _User(
+            username=username,
+            email="rr@example.com",
+            password_hash=get_password_hash(password),
+            role="user",
+            is_active=True,
+            auth_source="local",
+        )
+        db_session.add(user)
+        await db_session.flush()
+
+        secret = pyotp.random_base32()
+        db_session.add(
+            UserTOTP(
+                user_id=user.id,
+                secret=secret,
+                is_enabled=True,
+                backup_code_hashes=[],
+                last_totp_counter=None,  # no counter yet — first use establishes it
+            )
+        )
+        await db_session.commit()
+
+        pre_auth = await _login_get_pre_auth_token(async_client, username, password)
+        code = pyotp.TOTP(secret).now()
+        verify_resp = await async_client.post(
+            "/api/v1/auth/2fa/verify",
+            json={"pre_auth_token": pre_auth, "method": "totp", "code": code},
+        )
+        assert verify_resp.status_code == 200, verify_resp.text
+        session_token = verify_resp.json()["access_token"]
+
+        # Same code, same window → regenerate must reject as replay.
+        regen = await async_client.post(
+            "/api/v1/auth/2fa/totp/regenerate-backup-codes",
+            json={"code": code},
+            headers=_auth_header(session_token),
+        )
+        assert regen.status_code == 400, f"TOTP replay on regenerate should return 400, got {regen.status_code}"
+
+
 class TestRegenerateBackupCodes:
     """Tests for POST /api/v1/auth/2fa/totp/regenerate-backup-codes."""
 
@@ -1033,6 +1140,7 @@ class TestRegenerateBackupCodes:
             headers=_auth_header(token),
         )
         old_backup = enable_resp.json()["backup_codes"][0]
+        await _clear_totp_counter("regeninval")
 
         # Regenerate backup codes
         regen_resp = await async_client.post(
@@ -1052,6 +1160,58 @@ class TestRegenerateBackupCodes:
             json={"pre_auth_token": pre_auth_token, "method": "backup", "code": old_backup},
         )
         assert fail_resp.status_code == 401
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_backup_code_verify_iterates_all_codes_constant_time(self, async_client: AsyncClient):
+        """R4-Test13: ``_verify_2fa`` documents "always iterate all codes —
+        no early break" to keep position-in-list from leaking via timing.
+        Pin that invariant by spying on ``pwd_context.verify``: even when the
+        *first* backup code is the correct one, verify() must still be called
+        exactly ``len(backup_code_hashes)`` times.
+        """
+        from unittest.mock import patch
+
+        from backend.app.api.routes import mfa as mfa_mod
+
+        token = await _setup_and_login(async_client, "bcconsttime", "Bcconsttime1!")
+        setup_resp = await async_client.post("/api/v1/auth/2fa/totp/setup", headers=_auth_header(token))
+        secret = setup_resp.json()["secret"]
+        enable_resp = await async_client.post(
+            "/api/v1/auth/2fa/totp/enable",
+            json={"code": pyotp.TOTP(secret).now()},
+            headers=_auth_header(token),
+        )
+        assert enable_resp.status_code == 200
+        backup_codes = enable_resp.json()["backup_codes"]
+        assert len(backup_codes) == 10
+
+        # Use the FIRST backup code. If any regression reintroduces an early
+        # break on first match, the call count will drop to 1 instead of 10.
+        first_code = backup_codes[0]
+        pre_auth_token = await _login_get_pre_auth_token(async_client, "bcconsttime", "Bcconsttime1!")
+
+        real_verify = mfa_mod.pwd_context.verify
+        call_counter = {"n": 0}
+
+        def counting_verify(*args, **kwargs):
+            call_counter["n"] += 1
+            return real_verify(*args, **kwargs)
+
+        with patch.object(mfa_mod.pwd_context, "verify", side_effect=counting_verify):
+            resp = await async_client.post(
+                "/api/v1/auth/2fa/verify",
+                json={"pre_auth_token": pre_auth_token, "method": "backup", "code": first_code},
+            )
+        assert resp.status_code == 200, resp.text
+
+        # Must be >= 10 (one verify() per stored hash) even though the first
+        # code matched. Allow > 10 only if the implementation grows another
+        # verify() call (e.g. pre-auth-token path). If a future refactor uses
+        # early-break, this will drop to 1 and fail loudly.
+        assert call_counter["n"] >= 10, (
+            f"Expected >=10 pwd_context.verify calls for constant-time iteration, got {call_counter['n']}"
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1138,8 +1298,35 @@ class TestLoginResponseShape:
 # ===========================================================================
 
 
+async def _clear_totp_counter(username: str) -> None:
+    """Reset ``last_totp_counter`` to NULL for the given user.
+
+    ``/2fa/totp/enable`` records the accepted counter as part of its replay
+    guard. Tests that immediately re-use the same TOTP code at another
+    endpoint need to simulate a clean "first real 2FA use" state, so they
+    call this helper after enabling.
+    """
+    from sqlalchemy import select as sa_select, update as sa_update
+
+    from backend.app.core.database import async_session
+    from backend.app.models.user import User as _User
+    from backend.app.models.user_totp import UserTOTP as _UserTOTP
+
+    async with async_session() as reset_db:
+        user_id = (await reset_db.execute(sa_select(_User.id).where(_User.username == username))).scalar_one()
+        await reset_db.execute(sa_update(_UserTOTP).where(_UserTOTP.user_id == user_id).values(last_totp_counter=None))
+        await reset_db.commit()
+
+
 async def _setup_totp_user(client: AsyncClient, username: str, password: str) -> tuple[str, str]:
-    """Create user, set up and enable TOTP; return (bearer_token, totp_secret)."""
+    """Create user, set up and enable TOTP; return (bearer_token, totp_secret).
+
+    ``/2fa/totp/enable`` now records the accepted counter (replay guard), so
+    follow-up tests that intentionally exercise "use this code at another
+    endpoint within the same 30s window" must start from a *clean* counter.
+    This helper therefore clears ``last_totp_counter`` back to NULL after
+    enabling — simulating the "fresh user on first real 2FA use" state.
+    """
     token = await _setup_and_login(client, username, password)
     setup_resp = await client.post("/api/v1/auth/2fa/totp/setup", headers=_auth_header(token))
     secret = setup_resp.json()["secret"]
@@ -1148,6 +1335,10 @@ async def _setup_totp_user(client: AsyncClient, username: str, password: str) ->
         json={"code": pyotp.TOTP(secret).now()},
         headers=_auth_header(token),
     )
+    # Clear the counter recorded by /enable so the TOTP appears "unused" to
+    # downstream tests that rely on the first /verify call still accepting
+    # the current-window code.
+    await _clear_totp_counter(username)
     return token, secret
 
 
@@ -3014,3 +3205,355 @@ class TestOIDCExpiredTokenRejection:
         )
         remaining = result.scalar_one_or_none()
         assert remaining is not None, "Expired exchange token must not be consumed by a rejected request"
+
+
+# ===========================================================================
+# R4-Test14: OIDC misc hardening tests
+#   - Trailing-slash tolerance between issuer_url and discovery "issuer"
+#   - oidc_exchange token binds the JWT's sub to the stored username (the
+#     caller cannot redirect it to a different account)
+#   - Non-http(s) token_endpoint / jwks_uri in the discovery document are
+#     rejected at the callback path (mirrors the /authorize-path test in
+#     test_security.py)
+#   - Bare private-IP token_endpoint / jwks_uri are rejected (R4-I1 SSRF)
+# ===========================================================================
+
+
+class TestOIDCDiscoveryHardening:
+    """Hardening pins for the OIDC callback discovery-document validation."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_trailing_slash_issuer_mismatch_still_accepted(
+        self, async_client: AsyncClient, db_session: AsyncSession
+    ):
+        """Provider stores ``https://idp/`` but discovery returns ``https://idp``
+        (no trailing slash). Callback must still succeed — both sides are
+        normalised via rstrip("/") before the PyJWT issuer= check."""
+        import time
+        from unittest.mock import patch
+
+        import jwt as pyjwt
+
+        private_pem, jwks_data = _make_test_rsa_key()
+        issuer_with_slash = "https://idp.slash.example.com/"
+        issuer_no_slash = "https://idp.slash.example.com"
+        client_id = "oidc-slash-client"
+        nonce = secrets.token_urlsafe(16)
+
+        now = int(time.time())
+        id_token = pyjwt.encode(
+            {
+                "sub": "oidc-slash-sub",
+                "iss": issuer_no_slash,  # discovery returns no trailing slash
+                "aud": client_id,
+                "nonce": nonce,
+                "email": "slash@example.com",
+                "email_verified": True,
+                "iat": now,
+                "exp": now + 300,
+            },
+            private_pem,
+            algorithm="RS256",
+            headers={"kid": "test-kid-1"},
+        )
+
+        admin_token = await _setup_and_login(async_client, "slashadm", "slashadm1A!")
+        create_resp = await async_client.post(
+            "/api/v1/auth/oidc/providers",
+            json={
+                "name": "SlashIdP",
+                "issuer_url": issuer_with_slash,  # admin typed trailing slash
+                "client_id": client_id,
+                "client_secret": "test-secret",
+                "scopes": "openid email profile",
+                "is_enabled": True,
+                "auto_create_users": True,
+            },
+            headers=_auth_header(admin_token),
+        )
+        assert create_resp.status_code == 201
+        provider_id = create_resp.json()["id"]
+
+        state = secrets.token_urlsafe(32)
+        code_verifier = secrets.token_urlsafe(48)
+        db_session.add(
+            AuthEphemeralToken(
+                token=state,
+                token_type="oidc_state",
+                provider_id=provider_id,
+                nonce=nonce,
+                code_verifier=code_verifier,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+        )
+        await db_session.commit()
+
+        discovery_doc = {
+            "issuer": issuer_no_slash,
+            "authorization_endpoint": f"{issuer_no_slash}/auth",
+            "token_endpoint": f"{issuer_no_slash}/token",
+            "jwks_uri": f"{issuer_no_slash}/.well-known/jwks.json",
+        }
+        token_response = {
+            "access_token": "mock-access",
+            "token_type": "Bearer",
+            "id_token": id_token,
+        }
+
+        class _MockResp:
+            def __init__(self, data):
+                self._data = data
+                self.status_code = 200
+                self.is_success = True
+                self.text = str(data)
+
+            def json(self):
+                return self._data
+
+            def raise_for_status(self):
+                pass
+
+        class _MockHttpxClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def get(self, url, **kwargs):
+                if "jwks" in url:
+                    return _MockResp(jwks_data)
+                return _MockResp(discovery_doc)
+
+            async def post(self, url, **kwargs):
+                return _MockResp(token_response)
+
+        with patch("backend.app.api.routes.mfa.httpx.AsyncClient", _MockHttpxClient):
+            resp = await async_client.get(
+                f"/api/v1/auth/oidc/callback?code=x&state={state}",
+                follow_redirects=False,
+            )
+        assert resp.status_code == 302, resp.text
+        location = resp.headers.get("location", "")
+        assert "oidc_token=" in location, f"Trailing-slash mismatch broke the callback. Location={location!r}"
+        assert "oidc_error=" not in location
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_oidc_exchange_sub_matches_stored_username(self, async_client: AsyncClient, db_session: AsyncSession):
+        """An oidc_exchange token stored for ``alice`` must mint a JWT whose
+        ``sub`` claim is ``alice`` — the client cannot redirect it to a
+        different account by playing with request fields."""
+        from backend.app.core.auth import get_password_hash
+        from backend.app.models.user import User as _User
+
+        alice = _User(
+            username="alice_oidc_exch",
+            email="alice.exch@example.com",
+            password_hash=get_password_hash("Aliceexch1!"),
+            role="user",
+            is_active=True,
+            auth_source="oidc",
+        )
+        db_session.add(alice)
+        await db_session.flush()
+
+        exch_token = secrets.token_urlsafe(32)
+        db_session.add(
+            AuthEphemeralToken(
+                token=exch_token,
+                token_type="oidc_exchange",
+                username="alice_oidc_exch",
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=2),
+            )
+        )
+        await db_session.commit()
+
+        resp = await async_client.post(
+            "/api/v1/auth/oidc/exchange",
+            json={"oidc_token": exch_token},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        access_token = data["access_token"]
+
+        # Decode without verification just to inspect sub — we trust the issuer
+        # (ourselves) here; this is a pin on the contract, not a security check.
+        import jwt as pyjwt
+
+        payload = pyjwt.decode(access_token, options={"verify_signature": False})
+        assert payload["sub"] == "alice_oidc_exch", (
+            f"Exchange JWT sub must equal the stored username, got {payload.get('sub')!r}"
+        )
+        assert data["user"]["username"] == "alice_oidc_exch"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_callback_rejects_non_http_token_endpoint(self, async_client: AsyncClient, db_session: AsyncSession):
+        """Discovery ``token_endpoint: file:///etc/passwd`` must be rejected at
+        the callback path (not just at authorize)."""
+        from unittest.mock import patch
+
+        issuer = "https://idp.schemetest.example.com"
+        admin_token = await _setup_and_login(async_client, "schemeadm", "schemeadm1A!")
+        create_resp = await async_client.post(
+            "/api/v1/auth/oidc/providers",
+            json={
+                "name": "SchemeIdP",
+                "issuer_url": issuer,
+                "client_id": "c",
+                "client_secret": "s",
+                "scopes": "openid email",
+                "is_enabled": True,
+                "auto_create_users": True,
+            },
+            headers=_auth_header(admin_token),
+        )
+        assert create_resp.status_code == 201
+        provider_id = create_resp.json()["id"]
+
+        state = secrets.token_urlsafe(32)
+        db_session.add(
+            AuthEphemeralToken(
+                token=state,
+                token_type="oidc_state",
+                provider_id=provider_id,
+                nonce=secrets.token_urlsafe(16),
+                code_verifier=secrets.token_urlsafe(48),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+        )
+        await db_session.commit()
+
+        malicious_discovery = {
+            "issuer": issuer,
+            "authorization_endpoint": f"{issuer}/auth",
+            "token_endpoint": "file:///etc/passwd",
+            "jwks_uri": f"{issuer}/.well-known/jwks.json",
+        }
+
+        class _MockResp:
+            def __init__(self, data):
+                self._data = data
+                self.status_code = 200
+                self.is_success = True
+                self.text = str(data)
+
+            def json(self):
+                return self._data
+
+            def raise_for_status(self):
+                pass
+
+        class _MockHttpxClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def get(self, url, **kwargs):
+                return _MockResp(malicious_discovery)
+
+            async def post(self, url, **kwargs):
+                raise AssertionError("token_endpoint must not be called — SSRF guard failed")
+
+        with patch("backend.app.api.routes.mfa.httpx.AsyncClient", _MockHttpxClient):
+            resp = await async_client.get(
+                f"/api/v1/auth/oidc/callback?code=x&state={state}",
+                follow_redirects=False,
+            )
+        assert resp.status_code == 302
+        assert "invalid_discovery_document" in resp.headers.get("location", "")
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_callback_rejects_private_ip_token_endpoint(
+        self, async_client: AsyncClient, db_session: AsyncSession
+    ):
+        """R4-I1: Discovery pointing token_endpoint at a loopback / metadata
+        address must be rejected."""
+        from unittest.mock import patch
+
+        issuer = "https://idp.ssrftest.example.com"
+        admin_token = await _setup_and_login(async_client, "ssrfadm", "ssrfadm1A!")
+        create_resp = await async_client.post(
+            "/api/v1/auth/oidc/providers",
+            json={
+                "name": "SSRFIdP",
+                "issuer_url": issuer,
+                "client_id": "c",
+                "client_secret": "s",
+                "scopes": "openid email",
+                "is_enabled": True,
+                "auto_create_users": True,
+            },
+            headers=_auth_header(admin_token),
+        )
+        assert create_resp.status_code == 201
+        provider_id = create_resp.json()["id"]
+
+        state = secrets.token_urlsafe(32)
+        db_session.add(
+            AuthEphemeralToken(
+                token=state,
+                token_type="oidc_state",
+                provider_id=provider_id,
+                nonce=secrets.token_urlsafe(16),
+                code_verifier=secrets.token_urlsafe(48),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+        )
+        await db_session.commit()
+
+        # AWS EC2 instance-metadata address — the canonical SSRF target.
+        malicious_discovery = {
+            "issuer": issuer,
+            "authorization_endpoint": f"{issuer}/auth",
+            "token_endpoint": "http://169.254.169.254/latest/meta-data/iam/security-credentials/role",
+            "jwks_uri": f"{issuer}/.well-known/jwks.json",
+        }
+
+        class _MockResp:
+            def __init__(self, data):
+                self._data = data
+                self.status_code = 200
+                self.is_success = True
+                self.text = str(data)
+
+            def json(self):
+                return self._data
+
+            def raise_for_status(self):
+                pass
+
+        class _MockHttpxClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def get(self, url, **kwargs):
+                return _MockResp(malicious_discovery)
+
+            async def post(self, url, **kwargs):
+                raise AssertionError("token_endpoint must not be called — SSRF guard failed")
+
+        with patch("backend.app.api.routes.mfa.httpx.AsyncClient", _MockHttpxClient):
+            resp = await async_client.get(
+                f"/api/v1/auth/oidc/callback?code=x&state={state}",
+                follow_redirects=False,
+            )
+        assert resp.status_code == 302
+        assert "invalid_discovery_document" in resp.headers.get("location", "")

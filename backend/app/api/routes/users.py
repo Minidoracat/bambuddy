@@ -418,11 +418,20 @@ async def change_own_password(
             detail="Authentication required to change password",
         )
 
-    # Block password change for LDAP users
-    if getattr(current_user, "auth_source", "local") == "ldap":
+    # Block password change for externally-authenticated users (LDAP, OIDC).
+    # These users have no local password and must manage credentials at their IdP.
+    # Without this guard an OIDC-only user could silently set a local password
+    # and create an off-IdP backdoor into their own account.
+    auth_source = getattr(current_user, "auth_source", "local")
+    if auth_source == "ldap":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot change password for LDAP users — passwords are managed by the LDAP server",
+        )
+    if auth_source == "oidc":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot change password for OIDC users — passwords are managed by the identity provider",
         )
 
     # Verify current password

@@ -345,15 +345,27 @@ async def authenticate_user_by_email(db: AsyncSession, email: str, password: str
 
 
 async def is_auth_enabled(db: AsyncSession) -> bool:
-    """Check if authentication is enabled."""
+    """Check if authentication is enabled.
+
+    Fails closed: any unexpected DB error is propagated so FastAPI returns 500
+    rather than silently treating auth as disabled. The only "return False"
+    paths are (a) the settings row is genuinely absent (fresh install) and
+    (b) the settings table itself does not yet exist (first startup before
+    create_all, effectively the same condition).
+    """
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
     try:
         result = await db.execute(select(Settings).where(Settings.key == "auth_enabled"))
         setting = result.scalar_one_or_none()
         if setting is None:
             return False
         return setting.value.lower() == "true"
-    except Exception:
-        # If settings table doesn't exist or query fails, assume auth is disabled
+    except (OperationalError, ProgrammingError) as exc:
+        # Settings table does not exist yet (pre-create_all). Safe to treat as
+        # fresh install with auth disabled. Any other DB error must NOT be
+        # swallowed — it would open the gate.
+        logger.warning("is_auth_enabled: settings table unavailable (%s); defaulting to disabled", exc)
         return False
 
 

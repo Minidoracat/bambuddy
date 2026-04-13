@@ -392,9 +392,34 @@ async def login(raw_request: Request, request: LoginRequest, response: Response,
                         # Update email and group mappings on each login
                         await _sync_ldap_user(db, user, ldap_user, ldap_config)
         except Exception as e:
+            # R4-I5: Narrow error handling.
+            # - ldap3 exceptions (LDAPException and subclasses) mean the LDAP
+            #   subsystem itself failed (server unreachable, TLS error, filter
+            #   syntax, etc.). Downgrading these to "wrong password" hides real
+            #   operator-actionable failures behind a generic UX; log at ERROR
+            #   with exc_info so they surface in monitoring.
+            # - Any DB mutation from _provision_ldap_user / _sync_ldap_user may
+            #   have left the session dirty; roll it back before falling
+            #   through so the subsequent local-auth query runs on a clean
+            #   session.
             import logging
 
-            logging.getLogger(__name__).warning("LDAP authentication error, falling back to local: %s", e)
+            from ldap3.core.exceptions import LDAPException
+
+            log = logging.getLogger(__name__)
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+            if isinstance(e, LDAPException):
+                log.error("LDAP subsystem error during login for %r: %s", request.username, e, exc_info=True)
+            else:
+                # Non-LDAP exception (usually a DB error from provision/sync).
+                # Log with full traceback so the cause is visible; fall through
+                # to local auth so legitimate local users aren't locked out by
+                # an unrelated failure in the LDAP code path.
+                log.error("Unexpected error in LDAP login path for %r: %s", request.username, e, exc_info=True)
             ldap_user = None
 
     # Try username-based authentication (skip if already authenticated via LDAP)
@@ -603,7 +628,16 @@ async def logout(
                 try:
                     await revoke_jti(jti, expires_at, username)
                 except Exception as exc:
+                    # R4-I7: Don't silently return "logged out successfully"
+                    # when the JTI write failed — the token is still valid
+                    # until exp and the client needs to know to retry (or at
+                    # least drop the token locally and treat this as "not
+                    # fully logged out").
                     _logger.error("Failed to revoke JTI on logout for user %s: %s", username, exc)
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Logout failed — token could not be revoked; please retry",
+                    ) from exc
         except PyJWTError:
             client_ip = _get_client_ip(raw_request)
             ua = raw_request.headers.get("user-agent", "<unknown>")
@@ -816,6 +850,10 @@ async def _send_reset_email_or_delete_token(
             to_email,
             exc,
         )
+        # R4-I6: If the cleanup itself fails, the user is stuck: their
+        # reset-token row stays in the DB (they can't receive it) AND the
+        # per-email/IP rate-limit slots are already burned. Roll back the
+        # burnt slots so the user can retry once the DB recovers.
         try:
             async with async_session() as db:
                 await db.execute(
@@ -826,7 +864,24 @@ async def _send_reset_email_or_delete_token(
                 )
                 await db.commit()
         except Exception as db_exc:
-            _logger.error("Failed to delete reset token after send failure: %s", db_exc)
+            _logger.error(
+                "Failed to delete reset token after send failure — rolling back rate-limit slots: %s",
+                db_exc,
+            )
+            try:
+                async with async_session() as db:
+                    # Best-effort: remove the most recent PASSWORD_RESET_SEND
+                    # slot for this recipient and the most recent
+                    # PASSWORD_RESET_IP slot so the caller can retry.
+                    await db.execute(
+                        delete(AuthRateLimitEvent).where(
+                            AuthRateLimitEvent.username == to_email.lower(),
+                            AuthRateLimitEvent.event_type == EventType.PASSWORD_RESET_SEND,
+                        )
+                    )
+                    await db.commit()
+            except Exception as rb_exc:
+                _logger.error("Rate-limit rollback also failed after send failure: %s", rb_exc)
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)

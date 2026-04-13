@@ -86,6 +86,40 @@ from backend.app.services.email_service import get_smtp_settings, send_email
 logger = logging.getLogger(__name__)
 
 
+def _validate_discovery_url(url: str, field_name: str) -> str | None:
+    """Validate a URL returned from an OIDC discovery document.
+
+    Returns None if the URL passes, or an error label string (used as the
+    ``?oidc_error=`` query param / HTTPException detail fragment) if it fails.
+
+    The admin-supplied ``issuer_url`` is already validated (HTTPS-only, no
+    private/loopback/link-local bare IPs). However, the discovery JSON the
+    issuer returns controls the actual endpoints the server then calls
+    (authorization_endpoint / token_endpoint / jwks_uri). A malicious or
+    compromised IdP could point those at 169.254.169.254 (cloud metadata),
+    RFC1918, or loopback ports to pivot via the server's outbound identity.
+    This mirrors ``_validate_issuer_url`` to close that SSRF window.
+    """
+    import ipaddress
+    from urllib.parse import urlparse
+
+    if not url or not isinstance(url, str):
+        return "invalid_discovery_document"
+    if not url.startswith(("https://", "http://")):
+        logger.warning("OIDC discovery %s has invalid scheme: %s", field_name, url)
+        return "invalid_discovery_document"
+    host = urlparse(url).hostname or ""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        # hostname is a DNS name — trust the issuer-level domain check
+        return None
+    if addr.is_private or addr.is_loopback or addr.is_link_local:
+        logger.warning("OIDC discovery %s points to a private/loopback/link-local address: %s", field_name, url)
+        return "invalid_discovery_document"
+    return None
+
+
 def _as_utc(dt: datetime) -> datetime:
     """Return *dt* with UTC timezone attached.
 
@@ -361,14 +395,33 @@ def _assert_totp_not_replayed(totp_obj: pyotp.TOTP, totp_record: UserTOTP, code:
     # Determine which time-step the accepted code belongs to.
     now = datetime.now(timezone.utc)
     accepted_counter: int | None = None
-    for offset in (0, -1):  # current window first, then previous
-        candidate_time = now.timestamp() + offset * totp_obj.interval
-        candidate_counter = totp_obj.timecode(datetime.fromtimestamp(candidate_time, tz=timezone.utc))
-        if totp_obj.at(candidate_counter) == code:
-            accepted_counter = candidate_counter
+    # pyotp.verify(code, valid_window=1) accepts (current, -1, +1). Check all
+    # three candidate windows so the replay guard correctly locks out the
+    # exact window that verify() just accepted.
+    #
+    # Note: ``pyotp.TOTP.at(for_time)`` takes a TIMESTAMP (not a counter),
+    # so we must pass the datetime for the candidate window. ``.timecode()``
+    # gives us the counter value to store on the record.
+    for offset in (0, -1, 1):
+        candidate_dt = datetime.fromtimestamp(now.timestamp() + offset * totp_obj.interval, tz=timezone.utc)
+        if totp_obj.at(candidate_dt) == code:
+            accepted_counter = totp_obj.timecode(candidate_dt)
             break
     if accepted_counter is None:
-        accepted_counter = totp_obj.timecode(now)  # fallback (should not happen after verify())
+        # R4-I9: This branch means verify() returned True but neither the
+        # current nor the previous time-step produced a matching code —
+        # which can only happen if the TOTP secret, digit-count, or step
+        # interval changed between verify() and here, or if pyotp's
+        # valid_window was widened. Falling back to timecode(now) stores
+        # the *wrong* counter and opens a replay window. Log loudly so this
+        # regressed configuration surfaces in monitoring.
+        logger.warning(
+            "TOTP replay-protection fallback triggered for user_id=%s (totp_record id=%s) — "
+            "accepted_counter could not be derived; storing timecode(now) which may allow a one-step replay",
+            getattr(totp_record, "user_id", "?"),
+            getattr(totp_record, "id", "?"),
+        )
+        accepted_counter = totp_obj.timecode(now)
 
     totp_record.accept_counter(accepted_counter)
 
@@ -484,11 +537,17 @@ async def enable_totp(
             status_code=status.HTTP_400_BAD_REQUEST, detail="TOTP setup not initiated. Call /auth/2fa/totp/setup first."
         )
 
-    if not pyotp.TOTP(totp_record.secret).verify(body.code, valid_window=1):
+    totp_obj = pyotp.TOTP(totp_record.secret)
+    if not totp_obj.verify(body.code, valid_window=1):
         await record_failed_attempt(db, current_user.username, event_type=EventType.TWO_FA_ATTEMPT)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid TOTP code")
 
     await clear_failed_attempts(db, current_user.username, event_type=EventType.TWO_FA_ATTEMPT)
+    # R4-Test11 finding: enable_totp was the only /2fa endpoint that verified a
+    # TOTP code without recording the accepted counter. That opened a replay
+    # window where the same code used to enable could immediately be replayed
+    # at /2fa/verify or /2fa/totp/regenerate-backup-codes within the 30s step.
+    _assert_totp_not_replayed(totp_obj, totp_record, body.code)
     plain_codes, hashed_codes = _generate_backup_codes()
     totp_record.is_enabled = True
     totp_record.backup_code_hashes = hashed_codes
@@ -624,6 +683,9 @@ async def enable_email_otp(
     code_hash = pwd_context.hash(code)
     setup_token = secrets.token_urlsafe(32)
 
+    # R4-Nit: Stage the setup-token row *without* committing, send the email
+    # first, then commit. Matches ``send_email_otp`` ordering — if SMTP fails
+    # the row is discarded via rollback instead of orphaned in the DB.
     db.add(
         AuthEphemeralToken(
             token=setup_token,
@@ -634,7 +696,6 @@ async def enable_email_otp(
             expires_at=now + timedelta(minutes=10),
         )
     )
-    await db.commit()
 
     try:
         send_email(
@@ -654,12 +715,15 @@ async def enable_email_otp(
                 "If you did not request this, you can safely ignore this email.</p>"
             ),
         )
-        await record_email_otp_send(db, current_user.username)
     except Exception as exc:
+        await db.rollback()
         logger.error("Failed to send email OTP setup code to user_id=%d: %s", current_user.id, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to send verification email"
         )
+
+    await db.commit()
+    await record_email_otp_send(db, current_user.username)
 
     return {"message": "Verification code sent to your email address", "setup_token": setup_token}
 
@@ -767,6 +831,16 @@ async def send_email_otp(
     user = await get_user_by_username(db, username)
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+
+    # R4-Nit: Only send an OTP email when email-2FA is actually enabled for
+    # this user. Without this guard a caller in the pre-auth state could
+    # trigger wasted emails (and a weak enumeration signal) for accounts that
+    # never opted in to email OTP.
+    if not await _get_email_2fa_enabled(db, user.id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email 2FA is not enabled for this user",
+        )
 
     if not user.email:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User has no email address configured")
@@ -907,6 +981,14 @@ async def verify_2fa(
 
         otp_record.consume()
         await db.commit()
+        # R4-Nit: OTP is now burned but the common-path below will still
+        # consume the pre_auth_token. On the rare race where the common
+        # consume returns None the user must request a fresh OTP — that's
+        # acceptable UX; the alternative (burn pre_auth first, then OTP)
+        # would require bypassing the common-path consume and diverges more
+        # from the existing flow. The invariant that matters — "a given
+        # pre_auth_token grants at most one session" — is preserved by the
+        # common-path atomic consume.
 
     else:  # method == "backup"
         result = await db.execute(select(UserTOTP).where(UserTOTP.user_id == user.id))
@@ -1107,14 +1189,33 @@ async def delete_oidc_provider(
 @router.get("/oidc/authorize/{provider_id}", response_model=OIDCAuthorizeResponse)
 async def oidc_authorize(
     provider_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> OIDCAuthorizeResponse:
     """Return the OIDC authorization URL for the given provider."""
+    # R4-Nit: Per-IP rate limit. This endpoint is unauthenticated and fetches
+    # the IdP's discovery document on every call (HTTP GET, up to 10s). A
+    # caller who hammers /authorize can force the server to amplify outbound
+    # traffic to the IdP or keep many TCP connections open. 30 requests /
+    # 15-minute window is far more than any human login flow needs.
+    from backend.app.api.routes.auth import _get_client_ip
+
+    client_ip = _get_client_ip(request)
+    await check_rate_limit(
+        db,
+        client_ip,
+        event_type="oidc_authorize",
+        max_attempts=30,
+    )
+
     result = await db.execute(
         select(OIDCProvider).where(OIDCProvider.id == provider_id).where(OIDCProvider.is_enabled.is_(True))
     )
     provider = result.scalar_one_or_none()
     if not provider:
+        # Record the failed lookup so brute-force of provider IDs also trips
+        # the rate limit.
+        await record_failed_attempt(db, client_ip, event_type="oidc_authorize")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Provider not found or not enabled")
 
     # Fetch discovery document
@@ -1133,9 +1234,9 @@ async def oidc_authorize(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail="OIDC discovery document missing authorization_endpoint"
         )
-    # B2: SSRF guard — reject non-HTTP(S) schemes in the authorization endpoint
-    if not authorization_endpoint.startswith(("https://", "http://")):
-        logger.warning("OIDC discovery authorization_endpoint has invalid scheme: %s", authorization_endpoint)
+    # B2 + R4-I1: SSRF guard — reject non-HTTP(S) schemes AND bare private/
+    # loopback/link-local IPs in every URL pulled from the discovery document.
+    if _validate_discovery_url(authorization_endpoint, "authorization_endpoint") is not None:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="OIDC discovery document contains invalid authorization_endpoint",
@@ -1254,12 +1355,13 @@ async def oidc_callback(
         jwks_uri = discovery.get("jwks_uri")
         if not token_endpoint or not jwks_uri:
             return RedirectResponse(url=f"{frontend_error_url}invalid_discovery_document", status_code=302)
-        # L-R7-C: Reject non-HTTP(S) URLs in the discovery document to prevent
-        # SSRF via crafted responses (e.g. file://, gopher://, internal schemes).
-        if not token_endpoint.startswith(("https://", "http://")) or not jwks_uri.startswith(("https://", "http://")):
-            logger.warning(
-                "OIDC discovery document contains non-HTTP URL(s): token=%s jwks=%s", token_endpoint, jwks_uri
-            )
+        # L-R7-C + R4-I1: Reject non-HTTP(S) URLs AND bare private/loopback/
+        # link-local IPs in every discovery-document URL to prevent SSRF via
+        # crafted responses (file://, gopher://, 169.254.169.254, RFC1918, …).
+        if (
+            _validate_discovery_url(token_endpoint, "token_endpoint") is not None
+            or _validate_discovery_url(jwks_uri, "jwks_uri") is not None
+        ):
             return RedirectResponse(url=f"{frontend_error_url}invalid_discovery_document", status_code=302)
 
         # ── Step 2: Exchange authorization code for tokens ───────────────────
@@ -1546,8 +1648,14 @@ async def oidc_callback(
         logger.error("Unexpected error in OIDC callback (%s): %s", type(exc).__name__, exc, exc_info=True)
         try:
             return RedirectResponse(url=f"{frontend_error_url}internal_error", status_code=302)
-        except Exception:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="OIDC callback failed")
+        except Exception as resp_exc:
+            # R4-I8: preserve the original exception chain so both the root
+            # cause and the secondary failure are visible in tracebacks /
+            # exception-reporting tools.
+            logger.error("OIDC callback fallback RedirectResponse also failed: %s", resp_exc, exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="OIDC callback failed"
+            ) from exc
 
 
 @router.post("/oidc/exchange", response_model=LoginResponse)

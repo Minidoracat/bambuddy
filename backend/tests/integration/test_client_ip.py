@@ -128,3 +128,28 @@ def test_xff_with_extra_whitespace_trimmed():
     client = "192.0.2.33"
     req = _make_request(proxy, xff=f"  {client}  ,  {proxy}  ")
     assert _call(req, frozenset({proxy})) == client
+
+
+# ---------------------------------------------------------------------------
+# R4-Test12: right-to-left walk must be strict — attacker-injected leftmost
+# entry must never win attribution. Pins the documented semantics so a
+# refactor to "take XFF[0]" is caught.
+# ---------------------------------------------------------------------------
+
+
+def test_rightmost_non_proxy_wins_even_when_leftmost_is_attacker_spoof():
+    """Client behind a trusted proxy can inject arbitrary leftmost XFF entries.
+
+    Attacker (real IP = 203.0.113.200) sends ``X-Forwarded-For: 1.2.3.4``
+    through proxy1. At the server, XFF becomes ``"1.2.3.4, 203.0.113.200"``
+    and direct_ip = proxy1. The rate-limit bucket must be attributed to the
+    attacker's real IP (203.0.113.200, rightmost non-proxy) — never to
+    1.2.3.4 (the spoofed victim).
+    """
+    proxy1 = "10.0.0.1"
+    attacker_real = "203.0.113.200"
+    victim_spoofed = "1.2.3.4"
+    req = _make_request(proxy1, xff=f"{victim_spoofed}, {attacker_real}")
+    result = _call(req, frozenset({proxy1}))
+    assert result == attacker_real, f"Expected rightmost non-proxy {attacker_real!r}, got {result!r}"
+    assert result != victim_spoofed, "XFF leftmost must never win — it is attacker-controlled"

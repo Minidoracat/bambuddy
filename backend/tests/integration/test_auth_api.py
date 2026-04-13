@@ -752,6 +752,60 @@ class TestChangePasswordAPI:
 
         assert response.status_code == 401
 
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_change_password_invalidates_concurrent_sessions(self, async_client: AsyncClient, user_token: str):
+        """R4-Test10: Changing the password on session A must reject a JWT
+        issued earlier in a separate session B via the iat-freshness check.
+
+        Without this guard, all sessions except the one whose JTI was revoked
+        would remain valid until exp — defeating ``password_changed_at``.
+        """
+        import asyncio
+
+        # Issue a second token for the same user (session B) *before* the
+        # change. Both tokens are valid at this point.
+        second_login = await async_client.post(
+            "/api/v1/auth/login",
+            json={"username": "pwchangeuser", "password": "Oldpassword123!"},
+        )
+        assert second_login.status_code == 200
+        token_b = second_login.json()["access_token"]
+
+        # JWT iat and password_changed_at are both truncated to whole seconds;
+        # sleep past the second boundary so token_b's iat is strictly less than
+        # the post-change password_changed_at (otherwise the freshness check
+        # legitimately accepts a token issued in the same second).
+        await asyncio.sleep(1.2)
+
+        # Session B currently works.
+        me_before = await async_client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+        assert me_before.status_code == 200
+
+        # Session A changes the password.
+        change = await async_client.post(
+            "/api/v1/users/me/change-password",
+            headers={"Authorization": f"Bearer {user_token}"},
+            json={
+                "current_password": "Oldpassword123!",
+                "new_password": "Newpassword456!",
+            },
+        )
+        assert change.status_code == 200
+
+        # Session B's token now has an iat older than password_changed_at and
+        # must be rejected on the next protected call.
+        me_after = await async_client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+        assert me_after.status_code == 401, (
+            f"Expected 401 after password change on concurrent session, got {me_after.status_code}"
+        )
+
 
 class TestAuthMiddlewarePublicRoutes:
     """Tests for auth middleware public route configuration.

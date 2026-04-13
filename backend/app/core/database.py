@@ -1465,8 +1465,11 @@ async def run_migrations(conn):
     # Migration: Add challenge_id for pre-auth token client binding (HttpOnly cookie)
     await _safe_execute(conn, "ALTER TABLE auth_ephemeral_tokens ADD COLUMN challenge_id VARCHAR(128)")
 
-    # Migration: Add auto_link_existing_accounts column to oidc_providers (M-4)
-    await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN auto_link_existing_accounts BOOLEAN DEFAULT 1")
+    # Migration: Add auto_link_existing_accounts column to oidc_providers (M-4).
+    # R4-I2: default 0 to match the SQLAlchemy model default (False). M-2's
+    # whole rationale was "operators must explicitly opt in" — a DEFAULT 1 here
+    # would silently re-enable auto-link on upgrade for any existing rows.
+    await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN auto_link_existing_accounts BOOLEAN DEFAULT 0")
 
     # Migration: Add password_changed_at to users (M-R7-B)
     # Tracks the last time a user's password was changed/reset.  JWTs whose iat
